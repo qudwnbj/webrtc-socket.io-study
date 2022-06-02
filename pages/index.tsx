@@ -14,6 +14,7 @@ import AppBar from '@mui/material/AppBar';
 import Alert from '@mui/material/Alert';
 import AlertTitle from '@mui/material/AlertTitle';
 import Button from '@mui/material/Button';
+import Paper from '@mui/material/Paper';
 import CircularProgress from '@mui/material/CircularProgress';
 import FormControl from '@mui/material/FormControl';
 import IconButton from '@mui/material/IconButton';
@@ -23,13 +24,19 @@ import VideoCamIcon from '@mui/icons-material/VideoCam';
 import VideoCamOffIcon from '@mui/icons-material/VideoCamOff';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
+import PhoneEnabledIcon from '@mui/icons-material/PhoneEnabled';
+import PhoneDisabledIcon from '@mui/icons-material/PhoneDisabled';
 import Image from 'next/image';
 import WebRTCIcon from 'public/webrtc.svg';
+import { io } from 'socket.io-client';
 import type { NextPage } from 'next';
 import type { SelectChangeEvent } from '@mui/material';
+import type { MySocket } from 'types/socket-io';
+import type { ChatMessage } from 'types/chat';
 
 const Home: NextPage = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const socket = useRef<MySocket>();
   const [videoDeviceList, setVideoDeviceList] = useState<MediaDeviceInfo[]>();
   const [audioDeviceList, setAudioDeviceList] = useState<MediaDeviceInfo[]>();
   const [currentCameraLabel, setCurrentCameraLabel] = useState<string>();
@@ -40,6 +47,11 @@ const Home: NextPage = () => {
   const [userName, setUserName] = useState<string>('');
   const [roomName, setRoomName] = useState<string>('');
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isJoinedRoom, setIsJoinedRoom] = useState<boolean>(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [message, setMessage] = useState<string>('');
+  const [messageError, setMessageError] = useState<string | null>(null);
+  const [isCallOn, setIsCallOn] = useState<boolean>(false);
 
   /**
    * @see https://developer.mozilla.org/ko/docs/Web/API/MediaDevices
@@ -116,7 +128,46 @@ const Home: NextPage = () => {
     setRoomName(event.currentTarget.value);
   }, []);
 
+  const setNewMessage = useCallback((message: ChatMessage) => {
+    setMessages(prev => [...prev, message]);
+  }, []);
+
+  const onMessageChange = useCallback<React.FormEventHandler<HTMLInputElement>>(event => {
+    setMessageError(null);
+    setMessage(event.currentTarget.value);
+  }, []);
+
+  const onMessageSend = useCallback(() => {
+    setMessage('');
+    if (!socket.current) {
+      setMessageError('Something wrong on server...');
+      return;
+    }
+
+    if (!message) {
+      setMessageError('Please enter message');
+      return;
+    }
+
+    socket.current.emit('send_message', roomName, message, isSuccess => {
+      if (isSuccess) {
+        setNewMessage({
+          type: 'message',
+          userId: socket.current?.id,
+          userName,
+          message,
+        });
+      } else {
+        setMessageError('Something wrong on server...');
+      }
+    });
+  }, [message, roomName, setNewMessage, userName]);
+
   const onEnterRoomClick = useCallback(() => {
+    if (!socket.current || !socket.current.connected) {
+      setSubmitError("Can't connect with server");
+      return;
+    }
     if (!stream) {
       setSubmitError("Can't find user's device");
       return;
@@ -129,26 +180,66 @@ const Home: NextPage = () => {
       setSubmitError('Please insert room name');
       return;
     }
-  }, [userName, roomName, stream]);
+
+    socket.current.emit('join_room', roomName, userName, isSuccess => {
+      if (isSuccess) {
+        setIsJoinedRoom(true);
+        setNewMessage({
+          type: 'notice',
+          message: `you join room : ${roomName}`,
+        });
+      } else {
+        setSubmitError("Can't join room");
+      }
+    });
+  }, [userName, roomName, stream, setNewMessage]);
+
+  const handleCallOn = useCallback(() => {
+    if (!socket.current) {
+      setSubmitError("Can't connect with server");
+      return;
+    }
+
+    setIsCallOn(prev => !prev);
+  }, []);
 
   useEffect(() => {
     const getDevice = async () => {
-      /**
-       * @see https://developer.mozilla.org/ko/docs/Web/API/MediaDevices/enumerateDevices
-       */
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const cameras = devices.filter(device => device.kind === 'videoinput');
-      const mics = devices.filter(device => device.kind === 'audioinput');
+      try {
+        /**
+         * @see https://developer.mozilla.org/ko/docs/Web/API/MediaDevices/enumerateDevices
+         */
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices.filter(device => device.kind === 'videoinput');
+        const mics = devices.filter(device => device.kind === 'audioinput');
 
-      setTimeout(() => {
-        getStream({ video: true, audio: true });
-        setVideoDeviceList(cameras);
-        setAudioDeviceList(mics);
-      }, 1000);
+        setTimeout(() => {
+          getStream({ video: true, audio: true });
+          setVideoDeviceList(cameras);
+          setAudioDeviceList(mics);
+        }, 1000);
+      } catch (error) {
+        setSubmitError('There is no permission');
+      }
     };
 
     getDevice();
   }, [getStream]);
+
+  useEffect(() => {
+    const initSocket: MySocket = io(process.env.NEXT_PUBLIC_BACKEND_HOST, {
+      transports: ['websocket'],
+    });
+
+    initSocket.on('notice', chatMessage => {
+      setNewMessage(chatMessage);
+    });
+    initSocket.on('receive_message', chatMessage => {
+      setNewMessage(chatMessage);
+    });
+
+    socket.current = initSocket;
+  }, [setNewMessage]);
 
   return (
     <Container sx={{ width: '100vw', height: '100vh' }} disableGutters>
@@ -170,123 +261,150 @@ const Home: NextPage = () => {
       </AppBar>
       <Container sx={{ pt: 4 }}>
         <Grid container spacing={2}>
-          <Grid item xs={6}>
-            <Card>
-              <CardContent>
-                <Typography sx={{ mb: 1 }}>Camera</Typography>
-                {videoDeviceList && currentCameraLabel ? (
-                  <Box>
-                    <FormControl fullWidth>
-                      <InputLabel id="select-camera-label">Select Camera</InputLabel>
-                      <Select
-                        labelId="select-camera-label"
-                        label="Select Camera"
-                        value={currentCameraLabel}
-                        onChange={onCameraSelectChange}
+          {!isJoinedRoom ? (
+            <>
+              <Grid item xs={6}>
+                <Card>
+                  <CardContent>
+                    <Typography sx={{ mb: 1 }}>Camera</Typography>
+                    {videoDeviceList && currentCameraLabel ? (
+                      <Box>
+                        <FormControl fullWidth>
+                          <InputLabel id="select-camera-label">Select Camera</InputLabel>
+                          <Select
+                            labelId="select-camera-label"
+                            label="Select Camera"
+                            value={currentCameraLabel}
+                            onChange={onCameraSelectChange}
+                          >
+                            {videoDeviceList.map(videoDevice => (
+                              <MenuItem key={videoDevice.deviceId} value={videoDevice.label}>
+                                {videoDevice.label}
+                              </MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                      </Box>
+                    ) : (
+                      <Box
+                        sx={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          width: '100%',
+                          height: '100%',
+                        }}
                       >
-                        {videoDeviceList.map(videoDevice => (
-                          <MenuItem key={videoDevice.deviceId} value={videoDevice.label}>
-                            {videoDevice.label}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                  </Box>
-                ) : (
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      width: '100%',
-                      height: '100%',
-                    }}
-                  >
-                    <CircularProgress sx={{ mb: 1 }} />
-                    <Typography>Getting device...</Typography>
-                  </Box>
-                )}
-              </CardContent>
-            </Card>
-          </Grid>
-          <Grid item xs={6}>
-            <Card>
-              <CardContent>
-                <Typography sx={{ mb: 1 }}>Mic</Typography>
-                {audioDeviceList && currentCameraLabel ? (
-                  <Box>
-                    <FormControl fullWidth>
-                      <InputLabel id="select-mic-label">Select Mic</InputLabel>
-                      <Select
-                        labelId="select-camera-label"
-                        label="Select Mic"
-                        value={currentMicsLabel}
-                        onChange={onMicSelectChange}
+                        <CircularProgress sx={{ mb: 1 }} />
+                        <Typography>Getting device...</Typography>
+                      </Box>
+                    )}
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid item xs={6}>
+                <Card>
+                  <CardContent>
+                    <Typography sx={{ mb: 1 }}>Mic</Typography>
+                    {audioDeviceList && currentCameraLabel ? (
+                      <Box>
+                        <FormControl fullWidth>
+                          <InputLabel id="select-mic-label">Select Mic</InputLabel>
+                          <Select
+                            labelId="select-camera-label"
+                            label="Select Mic"
+                            value={currentMicsLabel}
+                            onChange={onMicSelectChange}
+                          >
+                            {audioDeviceList.map(audioDevice => (
+                              <MenuItem key={audioDevice.deviceId} value={audioDevice.label}>
+                                {audioDevice.label}
+                              </MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                      </Box>
+                    ) : (
+                      <Box
+                        sx={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          width: '100%',
+                          height: '100%',
+                        }}
                       >
-                        {audioDeviceList.map(audioDevice => (
-                          <MenuItem key={audioDevice.deviceId} value={audioDevice.label}>
-                            {audioDevice.label}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                    </FormControl>
-                  </Box>
-                ) : (
-                  <Box
-                    sx={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      width: '100%',
-                      height: '100%',
-                    }}
-                  >
-                    <CircularProgress sx={{ mb: 1 }} />
-                    <Typography>Getting device...</Typography>
-                  </Box>
-                )}
-              </CardContent>
-            </Card>
-          </Grid>
+                        <CircularProgress sx={{ mb: 1 }} />
+                        <Typography>Getting device...</Typography>
+                      </Box>
+                    )}
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid item xs={6}>
+                <Card>
+                  <CardContent>
+                    <Typography sx={{ mb: 1 }}>Options</Typography>
+                    <Box sx={{ display: 'flex', alignContent: 'center', justifyContent: 'center' }}>
+                      <IconButton color={isCameraOn ? 'primary' : 'error'} onClick={handleCameraOn}>
+                        {isCameraOn ? <VideoCamIcon /> : <VideoCamOffIcon />}
+                      </IconButton>
+                      <IconButton color={isMicOn ? 'primary' : 'error'} onClick={handleMicOn}>
+                        {isMicOn ? <MicIcon /> : <MicOffIcon />}
+                      </IconButton>
+                    </Box>
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid item xs={6}>
+                <Card>
+                  <CardContent>
+                    <Typography sx={{ mb: 1 }}>User</Typography>
+                    <TextField
+                      fullWidth
+                      label="User Name"
+                      sx={{ mb: 2 }}
+                      value={userName}
+                      inputProps={{
+                        onChange: onUserNameChange,
+                      }}
+                    />
+                  </CardContent>
+                </Card>
+              </Grid>
+            </>
+          ) : null}
           <Grid item xs={6}>
             <Card>
               <CardContent>
-                <Typography sx={{ mb: 1 }}>Options</Typography>
-                <Box sx={{ display: 'flex', alignContent: 'center', justifyContent: 'center' }}>
-                  <IconButton color={isCameraOn ? 'primary' : 'error'} onClick={handleCameraOn}>
-                    {isCameraOn ? <VideoCamIcon /> : <VideoCamOffIcon />}
-                  </IconButton>
-                  <IconButton color={isMicOn ? 'primary' : 'error'} onClick={handleMicOn}>
-                    {isMicOn ? <MicIcon /> : <MicOffIcon />}
-                  </IconButton>
-                </Box>
-              </CardContent>
-            </Card>
-          </Grid>
-          <Grid item xs={6}>
-            <Card>
-              <CardContent>
-                <Typography sx={{ mb: 1 }}>User</Typography>
-                <TextField
-                  fullWidth
-                  label="User Name"
-                  sx={{ mb: 2 }}
-                  value={userName}
-                  inputProps={{
-                    onChange: onUserNameChange,
-                  }}
-                />
-              </CardContent>
-            </Card>
-          </Grid>
-          <Grid item xs={6}>
-            <Card>
-              <CardContent>
-                <Typography sx={{ mb: 1 }}>Preview</Typography>
+                <Typography sx={{ mb: 1 }}>{isJoinedRoom ? 'Video call' : 'Preview'}</Typography>
                 {videoDeviceList ? (
-                  <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%' }} />
+                  <>
+                    <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%' }} />
+                    {isJoinedRoom ? (
+                      <>
+                        <Typography sx={{ mb: 1 }}>Options</Typography>
+                        <Box
+                          sx={{ display: 'flex', alignContent: 'center', justifyContent: 'center' }}
+                        >
+                          <IconButton
+                            color={isCameraOn ? 'primary' : 'error'}
+                            onClick={handleCameraOn}
+                          >
+                            {isCameraOn ? <VideoCamIcon /> : <VideoCamOffIcon />}
+                          </IconButton>
+                          <IconButton color={isMicOn ? 'primary' : 'error'} onClick={handleMicOn}>
+                            {isMicOn ? <MicIcon /> : <MicOffIcon />}
+                          </IconButton>
+                          <IconButton color={isCallOn ? 'error' : 'primary'} onClick={handleCallOn}>
+                            {isCallOn ? <PhoneDisabledIcon /> : <PhoneEnabledIcon />}
+                          </IconButton>
+                        </Box>
+                      </>
+                    ) : null}
+                  </>
                 ) : (
                   <Box
                     sx={{
@@ -308,29 +426,108 @@ const Home: NextPage = () => {
           <Grid item xs={6}>
             <Card>
               <CardContent sx={{ display: 'flex', flexDirection: 'column' }}>
-                <Typography sx={{ mb: 1 }}>Room</Typography>
-                <TextField
-                  fullWidth
-                  label="Room Name"
-                  sx={{ mb: 2 }}
-                  value={roomName}
-                  inputProps={{
-                    onChange: onRoomNameChange,
-                  }}
-                />
-                {submitError ? (
-                  <Alert severity="error" sx={{ mb: 2 }}>
-                    <AlertTitle>Error</AlertTitle>
-                    {submitError}
-                  </Alert>
-                ) : null}
-                <Button
-                  variant="contained"
-                  disabled={Boolean(submitError)}
-                  onClick={onEnterRoomClick}
-                >
-                  Enter Room
-                </Button>
+                <Typography sx={{ mb: 1 }}>{isJoinedRoom ? 'Chat' : 'Room'}</Typography>
+                {isJoinedRoom ? (
+                  <Box>
+                    <Box sx={{ height: '50vh' }}>
+                      {messages.map((message, index) => {
+                        if (message.type === 'notice') {
+                          return (
+                            <Box
+                              key={index}
+                              sx={{
+                                display: 'flex',
+                                justifyContent: 'center',
+                                width: '100%',
+                                height: 'max-content',
+                                mb: 1,
+                              }}
+                            >
+                              <Alert severity="info">{message.message}</Alert>
+                            </Box>
+                          );
+                        }
+
+                        if (socket.current && message.userId === socket.current.id) {
+                          return (
+                            <Box
+                              key={index}
+                              sx={{
+                                display: 'flex',
+                                flexDirection: 'column',
+                                alignItems: 'flex-end',
+                                width: '100%',
+                                height: 'max-content',
+                                mb: 1,
+                              }}
+                            >
+                              <Typography>me</Typography>
+                              <Paper elevation={2} sx={{ width: 'max-content', p: 1 }}>
+                                {message.message}
+                              </Paper>
+                            </Box>
+                          );
+                        }
+                        return (
+                          <Box
+                            key={index}
+                            sx={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              width: '100%',
+                              height: 'max-content',
+                              mb: 1,
+                            }}
+                          >
+                            <Typography>{message.userName}</Typography>
+                            <Paper elevation={2} sx={{ width: 'max-content', p: 1 }}>
+                              {message.message}
+                            </Paper>
+                          </Box>
+                        );
+                      })}
+                    </Box>
+                    <TextField
+                      fullWidth
+                      label="message"
+                      sx={{ mb: 2 }}
+                      value={message}
+                      inputProps={{
+                        onChange: onMessageChange,
+                      }}
+                    />
+                    {messageError ? <Alert severity="error">{messageError}</Alert> : null}
+                    <Button variant="contained" onClick={onMessageSend}>
+                      Send
+                    </Button>
+                    <Button>Leave</Button>
+                  </Box>
+                ) : (
+                  <>
+                    <TextField
+                      fullWidth
+                      label="Room Name"
+                      sx={{ mb: 2 }}
+                      value={roomName}
+                      inputProps={{
+                        onChange: onRoomNameChange,
+                      }}
+                    />
+                    {submitError ? (
+                      <Alert severity="error" sx={{ mb: 2 }}>
+                        <AlertTitle>Error</AlertTitle>
+                        {submitError}
+                      </Alert>
+                    ) : null}
+                    <Button
+                      variant="contained"
+                      disabled={Boolean(submitError)}
+                      onClick={onEnterRoomClick}
+                    >
+                      Enter Room
+                    </Button>
+                  </>
+                )}
               </CardContent>
             </Card>
           </Grid>
